@@ -9,7 +9,7 @@ import gc
 warnings.filterwarnings('ignore')
 
 # ============================================
-# 1. 데이터 로드 및 전처리
+# 1. 데이터 로드 및 전처리 (멘토 피드백 반영)
 # ============================================
 
 def load_data(train_path='data/train.parquet', submission_path='data/sample_submission.csv'):
@@ -19,10 +19,11 @@ def load_data(train_path='data/train.parquet', submission_path='data/sample_subm
     return train, submission
 
 def preprocess(train, 
-               # [핵심 1] 노이즈(View)를 0.2로 줄여서 확실한 신호만 남김
-               # Purchase와 Cart의 비율은 10:4 정도로 유지
-               event_weights={'view': 0.2, 'cart': 4, 'purchase': 10}, 
-               use_recent_days=90): 
+               # [멘토 피드백 1 & 2] 희소 이벤트(Cart/Purchase) 강조, 노이즈(View) 축소
+               # View는 빈도가 너무 높고 신호가 약하므로 0.5로 대폭 낮춤
+               # Cart는 구매 직전의 가장 강력한 신호이므로 10으로 격상
+               event_weights={'view': 0.5, 'cart': 10, 'purchase': 20}, 
+               use_recent_days=45): # [멘토 피드백 3] 데이터 축소: 최근 45일(1월 중순~2월 말) 집중
     
     train = train.copy()
     train['event_time'] = pd.to_datetime(train['event_time'])
@@ -31,7 +32,7 @@ def preprocess(train,
         max_date = train['event_time'].max()
         cutoff = max_date - pd.Timedelta(days=use_recent_days)
         train = train[train['event_time'] >= cutoff]
-        print(f"Using last {use_recent_days} days: {len(train):,} rows")
+        print(f"Using last {use_recent_days} days (Data Reduction): {len(train):,} rows")
         
     train['weight'] = train['event_type'].map(event_weights).fillna(1)
     return train
@@ -41,7 +42,7 @@ def preprocess(train,
 # ============================================
 
 class EASE:
-    def __init__(self, regularization=400): # [핵심 3] 400: 가장 밸런스 좋은 규제값
+    def __init__(self, regularization=1000): # 데이터가 줄었으므로 규제는 1000 유지 (과적합 방지)
         self.regularization = regularization
         self.B = None
         self.user_map = {}
@@ -66,9 +67,10 @@ class EASE:
         col = train['item_id'].map(self.item_map)
         data = train['final_weight'].values
         
+        # Matrix 생성
         X = csr_matrix((data.astype(np.float32), (row, col)), shape=(n_users, n_items))
         
-        # [필수] L2 Normalization 유지
+        # [핵심] L2 Normalization 유지 (가중치 폭발 방지)
         print("  - Applying L2 Normalization...")
         X = normalize(X, norm='l2', axis=1, copy=False)
         self.user_history_matrix = X
@@ -96,6 +98,7 @@ class PopularityBaseline:
         self.popular_items = []
         
     def fit(self, train):
+        # 인기 아이템도 "진짜 산 것" 위주로 (Purchase/Cart 가중치 반영된 weight 사용)
         item_scores = train.groupby('item_id')['final_weight'].sum()
         self.popular_items = item_scores.sort_values(ascending=False).index.tolist()
 
@@ -108,14 +111,14 @@ class BatchEnsemble:
         self.ease = None
         self.popularity = None
         
-    def fit(self, train, decay_days=14): # 14일 (2주) - 트렌드 반영 속도 최적화
+    def fit(self, train, decay_days=10): # [멘토 피드백] 2월 데이터 집중 -> 반감기 10일로 단축
         train = train.copy()
         max_time = train['event_time'].max()
         train['days_ago'] = (max_time - train['event_time']).dt.total_seconds() / 86400
         train['time_weight'] = np.exp(-train['days_ago'] / decay_days)
         train['final_weight'] = train['weight'] * train['time_weight']
         
-        self.ease = EASE(regularization=400)
+        self.ease = EASE(regularization=1000)
         self.ease.fit(train)
         
         self.popularity = PopularityBaseline()
@@ -125,12 +128,10 @@ class BatchEnsemble:
         results = {}
         reverse_item_map = self.ease.reverse_item_map
         
-        # [핵심 2] EASE 점수와 History 점수의 비율 조정
-        # 기존: EASE 1.5 : HIST 0.5 (재구매 힘이 너무 약했음)
-        # 변경: EASE 1.0 : HIST 2.5 (재구매를 강력하게 밀어줌)
-        # 이렇게 하면 "샀던 거 또 사기" + "그거랑 비슷한 거 사기"가 완벽하게 섞입니다.
+        # [전략] EASE에 거의 모든 것을 맡김
+        # History Boost는 아주 살짝만 (L2 Norm으로 이미 패턴이 잡혀있음)
         W_EASE = 1.0
-        W_HIST = 2.5 
+        W_HIST = 0.2
         
         for i in tqdm(range(0, len(user_ids), batch_size), desc="Batch Inference"):
             batch_users = user_ids[i : i + batch_size]
@@ -150,16 +151,15 @@ class BatchEnsemble:
 
             user_vectors = self.ease.user_history_matrix[batch_indices]
             
-            # 1. EASE Score
+            # EASE Score
             scores = user_vectors.dot(self.ease.B) * W_EASE 
             
-            # 2. History Boosting (강력해짐)
-            # L2 Norm된 값(0~1)에 2.5를 곱해서 더함 -> EASE 점수와 대등하거나 살짝 우위
+            # History Boosting
             rows, cols = user_vectors.nonzero()
             for r, c, val in zip(rows, cols, user_vectors.data):
                 scores[r, c] += (val * W_HIST)
             
-            # 3. Top-K
+            # Top-K
             if scores.shape[1] > n:
                 top_k_part = np.argpartition(-scores, n, axis=1)[:, :n]
                 row_indices = np.arange(scores.shape[0])[:, None]
@@ -188,11 +188,12 @@ def main():
     gc.collect()
     train, submission = load_data()
     
-    # 90일 데이터 사용 (EASE 학습 안정성 확보)
-    train = preprocess(train, use_recent_days=90) 
+    # [핵심] 멘토 조언: "데이터 축소" -> 최근 45일만 사용
+    train = preprocess(train, use_recent_days=45) 
     
     model = BatchEnsemble()
-    model.fit(train, decay_days=14) 
+    # [핵심] 멘토 조언: "2월 가중치" -> Decay 10일 (빠르게 감소)
+    model.fit(train, decay_days=10) 
     
     print(f"\nGeneraring submission...")
     users = submission['user_id'].unique().tolist()
@@ -213,10 +214,9 @@ def main():
             results.append({'user_id': user_id, 'item_id': item_id})
             
     output = pd.DataFrame(results)
-    
-    # 파일명: "History Boosted" -> 재구매 강화 버전
-    output.to_csv('submission_history_boost_v2.csv', index=False)
-    print("\nSaved to: submission_history_boost_v2.csv")
+    # 멘토 피드백 반영 버전
+    output.to_csv('submission_mentor_feedback.csv', index=False)
+    print("\nSaved to: submission_mentor_feedback.csv")
 
 if __name__ == "__main__":
     main()

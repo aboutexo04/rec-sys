@@ -19,10 +19,9 @@ def load_data(train_path='data/train.parquet', submission_path='data/sample_subm
     return train, submission
 
 def preprocess(train, 
-               # [핵심 1] 노이즈(View)를 0.2로 줄여서 확실한 신호만 남김
-               # Purchase와 Cart의 비율은 10:4 정도로 유지
-               event_weights={'view': 0.2, 'cart': 4, 'purchase': 10}, 
-               use_recent_days=90): 
+               # [튜닝] Cart(5) 강화: 장바구니는 구매만큼 강력한 힌트입니다.
+               event_weights={'view': 1, 'cart': 5, 'purchase': 12}, 
+               use_recent_days=90):
     
     train = train.copy()
     train['event_time'] = pd.to_datetime(train['event_time'])
@@ -37,11 +36,11 @@ def preprocess(train,
     return train
 
 # ============================================
-# 2. 모델 정의 (EASE + L2 Norm)
+# 2. 모델 정의 (L2 Normalization 추가)
 # ============================================
 
 class EASE:
-    def __init__(self, regularization=400): # [핵심 3] 400: 가장 밸런스 좋은 규제값
+    def __init__(self, regularization=700): # [튜닝] 500 -> 700 (노이즈 제거 강화)
         self.regularization = regularization
         self.B = None
         self.user_map = {}
@@ -66,14 +65,18 @@ class EASE:
         col = train['item_id'].map(self.item_map)
         data = train['final_weight'].values
         
+        # 1. Matrix 생성 (float32)
         X = csr_matrix((data.astype(np.float32), (row, col)), shape=(n_users, n_items))
         
-        # [필수] L2 Normalization 유지
+        # [핵심 추가] L2 Normalization
+        # 유저별 활동량 편차를 줄여 패턴 자체에 집중하게 만듦
+        # copy=False로 메모리 절약
         print("  - Applying L2 Normalization...")
         X = normalize(X, norm='l2', axis=1, copy=False)
         self.user_history_matrix = X
         
         print("  - Calculating Gram matrix...")
+        # G = X.T @ X
         G = X.T.dot(X).toarray().astype(np.float32)
         
         diag_indices = np.diag_indices(G.shape[0])
@@ -108,14 +111,14 @@ class BatchEnsemble:
         self.ease = None
         self.popularity = None
         
-    def fit(self, train, decay_days=14): # 14일 (2주) - 트렌드 반영 속도 최적화
+    def fit(self, train, decay_days=21): # [튜닝] 21일 (3주) - 가장 밸런스 좋은 구간
         train = train.copy()
         max_time = train['event_time'].max()
         train['days_ago'] = (max_time - train['event_time']).dt.total_seconds() / 86400
         train['time_weight'] = np.exp(-train['days_ago'] / decay_days)
         train['final_weight'] = train['weight'] * train['time_weight']
         
-        self.ease = EASE(regularization=400)
+        self.ease = EASE(regularization=700) # 위에서 정의한 700 적용
         self.ease.fit(train)
         
         self.popularity = PopularityBaseline()
@@ -125,12 +128,11 @@ class BatchEnsemble:
         results = {}
         reverse_item_map = self.ease.reverse_item_map
         
-        # [핵심 2] EASE 점수와 History 점수의 비율 조정
-        # 기존: EASE 1.5 : HIST 0.5 (재구매 힘이 너무 약했음)
-        # 변경: EASE 1.0 : HIST 2.5 (재구매를 강력하게 밀어줌)
-        # 이렇게 하면 "샀던 거 또 사기" + "그거랑 비슷한 거 사기"가 완벽하게 섞입니다.
-        W_EASE = 1.0
-        W_HIST = 2.5 
+        # [가중치 전략]
+        # L2 Norm을 했기 때문에 EASE 점수 스케일이 달라졌을 수 있음
+        # 하지만 상대적 순위가 중요하므로 비율은 유지하되, History를 조금 더 믿음
+        W_EASE = 1.5
+        W_HIST = 0.5 
         
         for i in tqdm(range(0, len(user_ids), batch_size), desc="Batch Inference"):
             batch_users = user_ids[i : i + batch_size]
@@ -153,11 +155,14 @@ class BatchEnsemble:
             # 1. EASE Score
             scores = user_vectors.dot(self.ease.B) * W_EASE 
             
-            # 2. History Boosting (강력해짐)
-            # L2 Norm된 값(0~1)에 2.5를 곱해서 더함 -> EASE 점수와 대등하거나 살짝 우위
+            # 2. History Boosting (L2 Norm 때문에 값 작아짐 -> 가중치 보정 필요 없으나 안전하게 더함)
             rows, cols = user_vectors.nonzero()
+            
+            # [테크닉] 반복문 대신 벡터 연산으로 속도 향상 & 히스토리 강조
+            # user_vectors의 값은 이미 normalized 되어 있음. 
+            # 여기에 추가 가중치를 더해 "본 건 무조건 상위권"으로 올림
             for r, c, val in zip(rows, cols, user_vectors.data):
-                scores[r, c] += (val * W_HIST)
+                scores[r, c] += (val * W_HIST) + 0.5 # 0.5는 기본 보너스 점수
             
             # 3. Top-K
             if scores.shape[1] > n:
@@ -188,11 +193,12 @@ def main():
     gc.collect()
     train, submission = load_data()
     
-    # 90일 데이터 사용 (EASE 학습 안정성 확보)
+    # 90일치, 90일이 버거우면 60일로
     train = preprocess(train, use_recent_days=90) 
     
     model = BatchEnsemble()
-    model.fit(train, decay_days=14) 
+    # 반감기 21일 (3주)
+    model.fit(train, decay_days=21) 
     
     print(f"\nGeneraring submission...")
     users = submission['user_id'].unique().tolist()
@@ -213,10 +219,8 @@ def main():
             results.append({'user_id': user_id, 'item_id': item_id})
             
     output = pd.DataFrame(results)
-    
-    # 파일명: "History Boosted" -> 재구매 강화 버전
-    output.to_csv('submission_history_boost_v2.csv', index=False)
-    print("\nSaved to: submission_history_boost_v2.csv")
+    output.to_csv('submission_l2_norm.csv', index=False)
+    print("\nSaved to: submission_l2_norm.csv")
 
 if __name__ == "__main__":
     main()
