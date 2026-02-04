@@ -19,9 +19,9 @@ def load_data(train_path='data/train.parquet', submission_path='data/sample_subm
     return train, submission
 
 def preprocess(train, 
-               # [튜닝] Cart를 5 -> 8로 상향 (살 뻔했던 거 다시 보여주기)
-               # Purchase 20은 유지 (Best Setting)
-               event_weights={'view': 1, 'cart': 8, 'purchase': 20}, 
+               # [복구] View=1 (클릭 정보 살림), Purchase=20 (확실한 선호)
+               # 0.1511 점수를 냈던 황금 비율로 복귀
+               event_weights={'view': 1, 'cart': 5, 'purchase': 20}, 
                use_recent_days=90): 
     
     train = train.copy()
@@ -37,11 +37,11 @@ def preprocess(train,
     return train
 
 # ============================================
-# 2. 모델 정의 (EASE)
+# 2. 모델 정의 (EASE + High Reg)
 # ============================================
 
 class EASE:
-    def __init__(self, regularization=1300): # [튜닝] 1200 -> 1300 (안전장치 강화)
+    def __init__(self, regularization=1500): # [튜닝] 1000 -> 1500 (고가중치 제어용 강한 규제)
         self.regularization = regularization
         self.B = None
         self.user_map = {}
@@ -68,6 +68,7 @@ class EASE:
         
         X = csr_matrix((data.astype(np.float32), (row, col)), shape=(n_users, n_items))
         
+        # L2 Normalization (필수)
         print("  - Applying L2 Normalization...")
         X = normalize(X, norm='l2', axis=1, copy=False)
         self.user_history_matrix = X
@@ -99,7 +100,7 @@ class PopularityBaseline:
         self.popular_items = item_scores.sort_values(ascending=False).index.tolist()
 
 # ============================================
-# 3. 앙상블 클래스 (하이브리드 디케이 정밀 튜닝)
+# 3. 앙상블 클래스
 # ============================================
 
 class BatchEnsemble:
@@ -107,22 +108,14 @@ class BatchEnsemble:
         self.ease = None
         self.popularity = None
         
-    def fit(self, train): 
-        print("Calculating Hybrid Time Weights (Optimized)...")
+    def fit(self, train, decay_days=28): # [튜닝] 21일 -> 28일 (한 달 주기 반영)
         train = train.copy()
         max_time = train['event_time'].max()
         train['days_ago'] = (max_time - train['event_time']).dt.total_seconds() / 86400
-        
-        # [핵심 변경] 비율 조정: 단기 0.25 : 장기 0.75
-        # 0.1516(장기)의 안정성을 더 가져오면서 0.1521의 유연함을 유지
-        w_short = np.exp(-train['days_ago'] / 7)
-        w_long = np.exp(-train['days_ago'] / 28)
-        
-        # 0.4:0.6 -> 0.25:0.75 (장기 패턴 우대)
-        train['time_weight'] = (w_short * 0.25) + (w_long * 0.75)
+        train['time_weight'] = np.exp(-train['days_ago'] / decay_days)
         train['final_weight'] = train['weight'] * train['time_weight']
         
-        self.ease = EASE(regularization=1300)
+        self.ease = EASE(regularization=1500) # 정의한 1500 적용
         self.ease.fit(train)
         
         self.popularity = PopularityBaseline()
@@ -132,9 +125,9 @@ class BatchEnsemble:
         results = {}
         reverse_item_map = self.ease.reverse_item_map
         
-        # 가중치 유지 (이건 건드리지 맙시다)
+        # [튜닝] 0.1511 점수 비율로 회귀하되, History를 아주 살짝만 더 챙김
         W_EASE = 1.5
-        W_HIST = 0.6
+        W_HIST = 0.6  # (0.5 -> 0.6) 미세 조정
         
         for i in tqdm(range(0, len(user_ids), batch_size), desc="Batch Inference"):
             batch_users = user_ids[i : i + batch_size]
@@ -191,10 +184,12 @@ def main():
     gc.collect()
     train, submission = load_data()
     
+    # 90일 데이터 (안전)
     train = preprocess(train, use_recent_days=90) 
     
     model = BatchEnsemble()
-    model.fit(train) 
+    # 28일 반감기 (월간 패턴)
+    model.fit(train, decay_days=28) 
     
     print(f"\nGeneraring submission...")
     users = submission['user_id'].unique().tolist()
@@ -215,9 +210,9 @@ def main():
             results.append({'user_id': user_id, 'item_id': item_id})
             
     output = pd.DataFrame(results)
-    # 파일명: 비율 최적화 버전
-    output.to_csv('submission_hybrid_optimized_ratio.csv', index=False)
-    print("\nSaved to: submission_hybrid_optimized_ratio.csv")
+    # 파일명: 안정성 강화 버전
+    output.to_csv('submission_monthly_cycle.csv', index=False)
+    print("\nSaved to: submission_monthly_cycle.csv")
 
 if __name__ == "__main__":
     main()

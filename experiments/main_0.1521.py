@@ -19,9 +19,8 @@ def load_data(train_path='data/train.parquet', submission_path='data/sample_subm
     return train, submission
 
 def preprocess(train, 
-               # [튜닝] Cart를 5 -> 8로 상향 (살 뻔했던 거 다시 보여주기)
-               # Purchase 20은 유지 (Best Setting)
-               event_weights={'view': 1, 'cart': 8, 'purchase': 20}, 
+               # [검증된 성공 공식 유지] View 살리고, Purchase 강력하게
+               event_weights={'view': 1, 'cart': 5, 'purchase': 20}, 
                use_recent_days=90): 
     
     train = train.copy()
@@ -41,7 +40,7 @@ def preprocess(train,
 # ============================================
 
 class EASE:
-    def __init__(self, regularization=1300): # [튜닝] 1200 -> 1300 (안전장치 강화)
+    def __init__(self, regularization=1200): # [미세 튜닝] 1500 -> 1200 (정보량 증가에 따른 유연성 확보)
         self.regularization = regularization
         self.B = None
         self.user_map = {}
@@ -99,7 +98,7 @@ class PopularityBaseline:
         self.popular_items = item_scores.sort_values(ascending=False).index.tolist()
 
 # ============================================
-# 3. 앙상블 클래스 (하이브리드 디케이 정밀 튜닝)
+# 3. 앙상블 클래스 (하이브리드 디케이)
 # ============================================
 
 class BatchEnsemble:
@@ -107,22 +106,21 @@ class BatchEnsemble:
         self.ease = None
         self.popularity = None
         
-    def fit(self, train): 
-        print("Calculating Hybrid Time Weights (Optimized)...")
+    def fit(self, train): # [핵심] decay_days 파라미터 대신 내부 로직 사용
+        print("Calculating Hybrid Time Weights...")
         train = train.copy()
         max_time = train['event_time'].max()
         train['days_ago'] = (max_time - train['event_time']).dt.total_seconds() / 86400
         
-        # [핵심 변경] 비율 조정: 단기 0.25 : 장기 0.75
-        # 0.1516(장기)의 안정성을 더 가져오면서 0.1521의 유연함을 유지
+        # [필살기] Short-term(7일) & Long-term(28일) 혼합
+        # 단기 트렌드(0.4) + 장기 루틴(0.6)
         w_short = np.exp(-train['days_ago'] / 7)
         w_long = np.exp(-train['days_ago'] / 28)
         
-        # 0.4:0.6 -> 0.25:0.75 (장기 패턴 우대)
-        train['time_weight'] = (w_short * 0.25) + (w_long * 0.75)
+        train['time_weight'] = (w_short * 0.4) + (w_long * 0.6)
         train['final_weight'] = train['weight'] * train['time_weight']
         
-        self.ease = EASE(regularization=1300)
+        self.ease = EASE(regularization=1200)
         self.ease.fit(train)
         
         self.popularity = PopularityBaseline()
@@ -132,7 +130,7 @@ class BatchEnsemble:
         results = {}
         reverse_item_map = self.ease.reverse_item_map
         
-        # 가중치 유지 (이건 건드리지 맙시다)
+        # 가중치 유지 (검증된 비율)
         W_EASE = 1.5
         W_HIST = 0.6
         
@@ -191,9 +189,11 @@ def main():
     gc.collect()
     train, submission = load_data()
     
+    # 90일 데이터
     train = preprocess(train, use_recent_days=90) 
     
     model = BatchEnsemble()
+    # 파라미터 없이 호출 (내부에서 하이브리드 계산)
     model.fit(train) 
     
     print(f"\nGeneraring submission...")
@@ -215,9 +215,9 @@ def main():
             results.append({'user_id': user_id, 'item_id': item_id})
             
     output = pd.DataFrame(results)
-    # 파일명: 비율 최적화 버전
-    output.to_csv('submission_hybrid_optimized_ratio.csv', index=False)
-    print("\nSaved to: submission_hybrid_optimized_ratio.csv")
+    # 파일명: 하이브리드 디케이 (단기+장기)
+    output.to_csv('submission_hybrid_decay.csv', index=False)
+    print("\nSaved to: submission_hybrid_decay.csv")
 
 if __name__ == "__main__":
     main()
