@@ -19,9 +19,9 @@ def load_data(train_path='data/train.parquet', submission_path='data/sample_subm
     return train, submission
 
 def preprocess(train, 
-               # [전략 수정] View의 한계를 인정하고 Purchase를 25로 상향
-               # Cart 6 (Best) / View 1 (Base)
-               event_weights={'view': 1, 'cart': 6, 'purchase': 25}, 
+               # [튜닝] Cart: 6 (0.1521 모델의 5보다 +1, 8보다는 -2)
+               # Purchase: 20 (부동의 1위)
+               event_weights={'view': 1, 'cart': 6, 'purchase': 20}, 
                use_recent_days=90): 
     
     train = train.copy()
@@ -41,7 +41,7 @@ def preprocess(train,
 # ============================================
 
 class EASE:
-    def __init__(self, regularization=1400): # [튜닝] 1100 -> 1400 (구매 가중치 폭발을 제어)
+    def __init__(self, regularization=1100): # [전략] 1200 -> 1100 (규제 완화: 숨겨진 패턴 발굴)
         self.regularization = regularization
         self.B = None
         self.user_map = {}
@@ -99,7 +99,7 @@ class PopularityBaseline:
         self.popular_items = item_scores.sort_values(ascending=False).index.tolist()
 
 # ============================================
-# 3. 앙상블 클래스
+# 3. 앙상블 클래스 (0.1521 성공 공식 복구)
 # ============================================
 
 class BatchEnsemble:
@@ -108,19 +108,20 @@ class BatchEnsemble:
         self.popularity = None
         
     def fit(self, train): 
-        print("Calculating Hybrid Time Weights (0.1522 Formula)...")
+        print("Calculating Hybrid Time Weights (0.1521 Formula)...")
         train = train.copy()
         max_time = train['event_time'].max()
         train['days_ago'] = (max_time - train['event_time']).dt.total_seconds() / 86400
         
-        # [유지] 성공 공식 (40:60) - 이건 건드리지 맙시다.
+        # [복구] 0.1521점을 찍었던 "성공의 비율"로 회귀
+        # 단기(40%) : 장기(60%) -> 트렌드 반영 속도 UP
         w_short = np.exp(-train['days_ago'] / 7)
         w_long = np.exp(-train['days_ago'] / 28)
         
         train['time_weight'] = (w_short * 0.4) + (w_long * 0.6)
         train['final_weight'] = train['weight'] * train['time_weight']
         
-        self.ease = EASE(regularization=1400) # 정의한 1400
+        self.ease = EASE(regularization=1100) # 규제 1100 적용
         self.ease.fit(train)
         
         self.popularity = PopularityBaseline()
@@ -130,9 +131,9 @@ class BatchEnsemble:
         results = {}
         reverse_item_map = self.ease.reverse_item_map
         
-        # [유지] Best Weight
+        # 가중치 유지 (Best)
         W_EASE = 1.5
-        W_HIST = 0.6 
+        W_HIST = 0.6
         
         for i in tqdm(range(0, len(user_ids), batch_size), desc="Batch Inference"):
             batch_users = user_ids[i : i + batch_size]
@@ -213,9 +214,9 @@ def main():
             results.append({'user_id': user_id, 'item_id': item_id})
             
     output = pd.DataFrame(results)
-    # 파일명: 구매25 + 규제1400 (뷰 노이즈 제거)
-    output.to_csv('submission_pur25_reg1400.csv', index=False)
-    print("\nSaved to: submission_pur25_reg1400.csv")
+    # 파일명: 0.1521 베이스 + 미세조정
+    output.to_csv('submission_hybrid_tuned_v3.csv', index=False)
+    print("\nSaved to: submission_hybrid_tuned_v3.csv")
 
 if __name__ == "__main__":
     main()
